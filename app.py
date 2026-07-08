@@ -60,7 +60,7 @@ app = FastAPI(title="NudaUI Semantic Search", lifespan=lifespan)
 # En produccion conviene restringir allow_origins a ["https://nudaui.dev"].
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://nudaui.dev"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )

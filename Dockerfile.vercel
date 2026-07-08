@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Dependencias primero, para aprovechar el cache de capas de Docker
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# El código y los embeddings (datos estaticos, se hornean en la imagen)
+COPY app.py .
+COPY embeddings_enriched.json .
+
+# Vercel inyecta la variable PORT (por defecto 80). uvicorn debe escuchar ahi
+# Se usa "sh -c" para que ${PORT} se expanda en tiempo de ejecucion
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-80}"]
