@@ -2,19 +2,41 @@
 
 Natural-language search over the [NudaUI](https://nudaui.dev) component catalog. You describe what you want ("a loader with pulsing dots", "a button that glows on hover") and it returns the components that match, ranked by semantic similarity, with their category and a link to the code.
 
+**Live:** https://rag.nudaui.dev
+
 It is built as a standalone retrieval service, separate from the NudaUI site. The catalog is the corpus; the site is untouched.
 
-Two things drove this project. First, to build a RAG pipeline that is measured, not vibes-based: every change is evaluated against a fixed set of labeled queries so improvements are numbers, not hunches. Second, to seed a future search feature for NudaUI itself.
+Two things drove this project. First, to build a RAG pipeline that is measured, not vibes-based: every change is evaluated against a fixed set of labeled queries so improvements are numbers, not hunches. Second, to seed a search feature for NudaUI itself.
 
 ## How it works
 
 Retrieval runs in two phases.
 
-Indexing happens once. Each of the 1022 components is turned into a short text and embedded into a vector with [Voyage AI](https://voyageai.com). The vectors are stored with their metadata in a local JSON file.
+Indexing happens once. Each of the 1022 components is turned into a short text and embedded into a vector with [Voyage AI](https://voyageai.com). The vectors are stored with their metadata in a JSON file that gets baked into the deployed image.
 
 Search happens on every query. The user's phrase is embedded with the same model (using `input_type="query"` rather than `"document"`, which Voyage optimizes differently), then compared against every stored vector by cosine similarity. The top matches come back.
 
 Cosine similarity is implemented directly rather than pulled from a framework like LangChain or LlamaIndex. For a corpus this size a brute-force scan is fast enough, and writing it by hand means the retrieval path is fully understood rather than hidden behind an abstraction. pgvector is the migration path once the corpus or traffic grows; it is not needed yet.
+
+## API
+
+```
+GET /health
+  -> { "status": "ok", "components": 1022, "model": "...", "source": "..." }
+
+GET /search?q=<text>&k=<1..20>
+  -> { "query": "...", "count": 5, "results": [
+       { "id": "pulse-dots", "name": "Pulse Dots", "category": "Loaders",
+         "anchor": "https://nudaui.dev/components#pulse-dots", "score": 0.51 }
+     ] }
+```
+
+Try it:
+
+```bash
+curl "https://rag.nudaui.dev/health"
+curl "https://rag.nudaui.dev/search?q=loader%20with%20pulsing%20dots"
+```
 
 ## Results
 
@@ -22,7 +44,7 @@ The interesting part is what happens to retrieval quality when you change what g
 
 The baseline embeds each component using its name plus its category label and description. The problem: every component in a category shares that same category text, so within a category the only thing distinguishing "Pulse Dots" from "Rotating Squares" is two words in the name. The ranking inside a category suffers.
 
-The enriched version adds a signal the baseline never had: the component's own `cssInline`, extracted straight from the source catalog. The CSS of Pulse Dots says `border-radius: 50%` with pulse keyframes; the CSS of Rotating Squares does not. That difference is what lets the model tell them apart. No LLM is involved in the enrichment, so rebuilding the index costs nothing beyond the embedding calls and has no external dependency other than Voyage.
+The enriched version adds a signal the baseline never had: the component's own `cssInline`, extracted straight from the source catalog. The CSS of Pulse Dots says `border-radius: 50%` with pulse keyframes; the CSS of Rotating Squares does not. That difference is what lets the model tell them apart. No LLM is involved in the enrichment, so rebuilding the index costs nothing beyond the embedding calls and has no dependency other than Voyage.
 
 Measured on a golden set of 45 queries:
 
@@ -37,53 +59,50 @@ hit@k is the fraction of queries where at least one correct component appears in
 
 The headline is hit@1, up 13 points. That was the baseline's weak spot: it usually put a good answer somewhere in the top 5, but often not first. The CSS signal fixed the fine-grained ranking. Two categories that failed because components inside them looked identical to the retriever, loaders and skeletons, went from 67% to 100% on hit@5.
 
-The enrichment is not free of trade-offs, and the eval caught it. Text effects regressed from 100% to 67%. Many text-effect components share CSS properties (`filter`, `opacity`, transitions) while doing visually distinct things, so adding CSS pulled some of them together instead of apart. The honest read is that the CSS signal lifts the average and fixes categories where the distinction is stylistic, but adds noise where the distinction is semantic. That is a measured trade-off, not a win to wave around.
+The enrichment is not free of trade-offs, and the eval caught it. Text effects regressed from 100% to 67%. Many text-effect components share CSS properties (`filter`, `opacity`, transitions) while doing visually distinct things, so adding CSS pulled some of them together instead of apart. The honest read is that the CSS signal lifts the average and fixes categories where the distinction is stylistic, but adds noise where the distinction is semantic. A measured trade-off, not a win to wave around.
 
 One query fails in both versions ("menu with pill-style tabs"). A failure that survives an improvement points somewhere other than the signal it added, which makes it the natural target for a future reranking pass.
 
 ## Evaluation setup
 
-The golden set is 45 queries spread across 15 categories, a mix of literal ("striped progress bar") and conceptual ("something to show it's loading without a percentage"). Many queries are written in Spanish against an English catalog, so the numbers also reflect cross-lingual retrieval.
+The golden set is 45 queries across 15 categories, a mix of literal ("striped progress bar") and conceptual ("something to show it's loading without a percentage"). Many queries are written in Spanish against an English catalog, so the numbers also reflect cross-lingual retrieval.
 
 Ground truth was labeled by deciding what a user would accept for each query, then finding those component IDs from the catalog, never by copying what the search returned. Labeling against the system's own output would measure the system against itself. The eval script validates every labeled ID against the catalog before scoring, so a typo or a stale ID cannot silently deflate the result.
 
 The baseline number is frozen. Each change is a separate embeddings file measured with the same golden set, so a regression in one category is visible instead of being averaged away.
 
-## Stack
+## Stack and deployment
 
-Python, no RAG frameworks. Voyage AI (`voyage-4-lite`) for embeddings, which at this scale stays inside the free tier. Vectors stored as JSON on disk. Similarity by hand.
+Python, no RAG frameworks. FastAPI for the service, Voyage AI (`voyage-4-lite`) for embeddings, which at this scale stays inside the free tier. Vectors stored as JSON. Similarity by hand.
 
-## Running it
+Deployed on Vercel as an OCI container on Fluid compute. The embeddings file is static, so it is baked into the image and no persistent storage is needed. The service scales to zero when idle, which keeps it free at portfolio traffic; the trade-off is a cold start of a few seconds on the first request after a quiet spell. The Voyage key is a Vercel environment variable, never in the code or the image.
+
+## Running locally
 
 ```bash
-pip install voyageai
+pip install -r requirements.txt
 export VOYAGE_API_KEY="your-key"
 
-# baseline index (name + category)
-python ingest.py            # reads catalog.json, writes embeddings.json
-
-# enriched index (adds CSS signal)
-python ingest_enriched.py   # reads catalog-full.json, writes embeddings_enriched.json
-
-# search
+python ingest.py            # baseline index -> embeddings.json
+python ingest_enriched.py   # enriched index -> embeddings_enriched.json
 python search.py "a loader with pulsing dots"
-
-# evaluate and compare
 python eval.py                          # baseline
 python eval.py embeddings_enriched.json # enriched
+
+uvicorn app:app --reload    # serve locally at http://127.0.0.1:8000
 ```
 
 `catalog.json` and `catalog-full.json` come from the NudaUI API (`/api/catalog.json` and `/api/catalog-full.json`). `list_category.py` prints the components in a category, which is how the golden set was labeled.
 
 ## Status
 
-Done: ingestion, semantic search, a 45-query golden set, and a measured baseline-versus-enriched comparison.
+Done: ingestion, semantic search, a 45-query golden set, a measured baseline-versus-enriched comparison, an HTTP API, and deployment live at rag.nudaui.dev.
 
-Not done yet: a reranking pass to attack the text-effects noise and the pill-menu miss, migration to pgvector, an HTTP API around the retriever, and a web-facing search UI on NudaUI.
+Not done yet: a reranking pass to attack the text-effects noise and the pill-menu miss, migration to pgvector, a search UI on the NudaUI site, and restricting CORS to the site origin once that UI ships.
 
 ## Security
 
-API keys live in environment variables or a `.env` file that is gitignored. Nothing secret is committed. If a key ever lands in a commit, rotate it, since git history keeps it even after deletion.
+API keys live in environment variables (locally in a gitignored `.env`, in production as a Vercel variable). Nothing secret is committed. The `/search` endpoint is currently open; rate limiting is a later step. If a key ever lands in a commit, rotate it, since git history keeps it even after deletion.
 
 ## License
 
