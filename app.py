@@ -22,13 +22,46 @@ import json
 import os
 from contextlib import asynccontextmanager
 import voyageai
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 EMBEDDINGS_FILE = os.environ.get("EMBEDDINGS_FILE", "embeddings_enriched.json")
 MODEL = "voyage-4-lite"
 DEFAULT_K = 5
 MAX_K = 20
+
+# Rate limiting. Cada busqueda embebe la consulta con Voyage (una llamada de
+# pago) y recorre los ~1022 vectores, asi que el endpoint es caro y hay que
+# protegerlo de abuso: sin esto, un bot que dispare 14k peticiones nos vacia
+# la cuota de Voyage y satura el proceso.
+#
+# Los limites son configurables por entorno para poder ajustarlos sin
+# redeployar codigo. El almacenamiento por defecto es en memoria (suficiente
+# para un unico contenedor); apunta RATE_LIMIT_STORAGE_URI a Redis si algun
+# dia corren varias instancias detras de un balanceador.
+SEARCH_RATE_LIMIT = os.environ.get("SEARCH_RATE_LIMIT", "20/minute;300/hour")
+DEFAULT_RATE_LIMIT = os.environ.get("DEFAULT_RATE_LIMIT", "60/minute")
+RATE_LIMIT_STORAGE_URI = os.environ.get("RATE_LIMIT_STORAGE_URI", "memory://")
+
+
+def client_ip(request: Request) -> str:
+    """Identifica al cliente para el rate limiting.
+
+    Detras de un proxy/CDN (Vercel) todas las peticiones llegan con la IP del
+    proxy, asi que sin esto limitariamos a todos los usuarios como si fueran
+    uno. Preferimos la primera IP de X-Forwarded-For (el cliente original) y
+    caemos a la IP directa si no viene la cabecera.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_ip, storage_uri=RATE_LIMIT_STORAGE_URI)
 
 # Estado del servicio, poblado al arrancar
 state = {"records": [], "client": None}
@@ -56,6 +89,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NudaUI Semantic Search", lifespan=lifespan)
 
+# Registra el limiter: guarda el estado en app.state y devuelve un 429 con
+# JSON (y cabecera Retry-After) cuando se supera el limite.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Para que la web pueda llamar al API desde el navegador.
 # En produccion conviene restringir allow_origins a ["https://nudaui.dev"].
 app.add_middleware(
@@ -71,7 +109,8 @@ def cosine_with_norm(query_vec, query_norm, record):
     return dot / denom if denom else 0.0
 
 @app.get("/health")
-def health():
+@limiter.limit(DEFAULT_RATE_LIMIT)
+def health(request: Request):
     return{
         "status": "ok",
         "components": len(state["records"]),
@@ -80,7 +119,9 @@ def health():
     }
 
 @app.get("/search")
+@limiter.limit(SEARCH_RATE_LIMIT)
 def search(
+    request: Request,
     q: str = Query(..., min_length=1, description="Descripcion en lenguaje natural"),
     k: int = Query(DEFAULT_K, ge=1, le=MAX_K),
 ):
