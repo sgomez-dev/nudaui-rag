@@ -38,6 +38,28 @@ curl "https://rag.nudaui.dev/health"
 curl "https://rag.nudaui.dev/search?q=loader%20with%20pulsing%20dots"
 ```
 
+## Rate limiting
+
+Every `/search` embeds the query with Voyage (a paid call) and scans the whole
+corpus, so the endpoint is throttled per client IP to keep a burst of automated
+traffic from draining the Voyage quota or saturating the process. Over the limit
+the API replies `429 Too Many Requests` with a `Retry-After` header and a JSON
+body `{ "error": "Rate limit exceeded: ..." }`.
+
+Defaults (all configurable via environment variables, no redeploy needed):
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `SEARCH_RATE_LIMIT` | `20/minute;300/hour` | `GET /search` |
+| `DEFAULT_RATE_LIMIT` | `60/minute` | `GET /health` |
+| `RATE_LIMIT_STORAGE_URI` | `memory://` | storage backend |
+
+The client is identified by the first IP in `X-Forwarded-For` (the real caller
+behind Vercel's proxy), falling back to the socket address. Counters live in
+memory, which is enough for the single-container deployment; point
+`RATE_LIMIT_STORAGE_URI` at Redis (e.g. `redis://host:6379`) if the service ever
+runs as more than one instance behind a load balancer.
+
 ## Results
 
 The interesting part is what happens to retrieval quality when you change what gets embedded.
